@@ -1,0 +1,190 @@
+package com.verizon.HeuristicMachineModel
+
+import org.apache.spark.ml.Pipeline
+import org.apache.spark.mllib.tree.DecisionTree
+import org.apache.spark.mllib.tree.model.DecisionTreeModel
+import org.apache.spark.mllib.regression.LabeledPoint
+import org.apache.spark.ml.classification.DecisionTreeClassificationModel
+import org.apache.spark.ml.classification.DecisionTreeClassifier
+import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
+import org.apache.spark.ml.feature.{ IndexToString, StringIndexer, VectorIndexer }
+import org.apache.spark.ml.feature.VectorAssembler
+import org.apache.spark.mllib.linalg.VectorUDT
+import org.apache.spark.sql.functions.udf
+import org.apache.spark.sql.types.StructType
+import org.apache.spark.mllib.linalg.{ Vector, Vectors }
+import org.apache.spark.mllib.tree.model.Node
+import org.apache.spark.sql._
+import org.apache.spark.SparkConf
+import org.apache.spark.SparkContext
+import org.apache.spark.sql.hive.HiveContext
+
+object DTModel {
+
+  var leafnoderules = ""
+  var leafnodestring = ""
+  var finaloutput = ""
+  var rulestring = ""
+  var modelTreeOutput=""
+  var rulemap = scala.collection.mutable.Map[Int, String]()
+  var featureRulesmap = scala.collection.mutable.Map[Int, String]()
+
+  var featureColumnsArray: Array[String] = null
+  //DecisionTree Parameters
+  val numClasses = 2
+  val categoricalFeaturesInfo = Map[Int, Int]()
+  val impurity = "gini"
+  val maxDepth = 5
+  val maxBins = 64
+  case class dtreerules(node: String, prediction: String, probability: String, impurity: String, rule: String)
+  case class outputschema(node: String, rules: String, coverage: String, frequency: String)
+
+  def main(args: Array[String]) {
+
+    var inputTableName = args(0)
+    val featureImportanceTable = args(1)
+    var numOfFeatures = args(2).toInt
+    var responseColumn = args(3)
+    var outputTableName = args(4)
+
+    val conf = new SparkConf().setAppName("DT Model")
+    val sc = new SparkContext(conf)
+    val sqlContext = new HiveContext(sc);
+    import sqlContext.implicits._
+
+    val variableSelectionSQLStatement = "select feature_name from " + featureImportanceTable + " order by importance desc limit " + numOfFeatures
+    val inputColumns = sqlContext.sql(variableSelectionSQLStatement).rdd.map(p => p.mkString).collect().filter(p => p.trim != responseColumn).mkString(",")
+    val selectedColumns = (inputColumns + "," + responseColumn).split(",").map(p => "`" + p + "`").mkString(",")
+    val sqlStatement = "select " + selectedColumns + " from " + inputTableName
+    val inputdf = sqlContext.sql(sqlStatement).na.drop
+    val columnArray = (inputColumns + "," + responseColumn).split(",")
+    val index_transformers: Array[org.apache.spark.ml.PipelineStage] = columnArray.map(cname => new StringIndexer().setInputCol(cname).setOutputCol(s"${cname}_index"))
+    val featureColumns = columnArray.filter(p => p != responseColumn).map(p => p + "_index")
+    val features_assembler = new VectorAssembler().setInputCols(featureColumns).setOutputCol("features")
+    val pipelinestages = index_transformers :+ features_assembler
+    val index_pipeline = new Pipeline().setStages(pipelinestages)
+    val index_model = index_pipeline.fit(inputdf)
+    val predictionsDF = index_model.transform(inputdf)
+    val labeled_data = predictionsDF.map(row => LabeledPoint(row.getDouble(2 * (columnArray.size) - 1), row(2 * columnArray.size).asInstanceOf[Vector]))
+   featureColumnsArray = columnArray.filter(p => p != responseColumn)
+   var df_lookup: Array[org.apache.spark.sql.DataFrame] = new Array[org.apache.spark.sql.DataFrame](featureColumnsArray.size)
+    for (i <- 0 to featureColumnsArray.size - 1) {
+      df_lookup(i) = index_model.stages(i).transform(inputdf).select(featureColumnsArray(i), featureColumnsArray(i) + "_index").distinct
+    }
+    val model = DecisionTree.trainClassifier(labeled_data, numClasses, categoricalFeaturesInfo, impurity, maxDepth, maxBins)
+    val rootNode = model.topNode
+    rulestring = ""
+    modelTreeOutput = ""
+    modelTreeOutput = extractRulesFromModelTree(rootNode, "true")
+    var modelTreeOutputArray = modelTreeOutput.split("\n")
+    modelTreeOutputArray.map(p => p.split("\t")).filter(p => p.size > 4).map(p => (rulemap += p(0).trim.toInt -> p(4)))
+    val parentNodes = modelTreeOutputArray.map(p => p.split("\t")).filter(p => p.size > 4).distinct
+    val leafNodes = modelTreeOutputArray.map(p => p.split("\t")).filter(p => p.size == 4).map(p => p(0)).distinct
+    val outputArray = parentNodes.map(p => Array(p(0), p(1), p(2), p(3), if (p(0) == "1") { "" } else { if ((p(0).toInt) % 2 == 0) { featureToColumnName(rulemap.get(p(0).toInt / 2).get.split(",")(0),df_lookup) } else { featureToColumnName(rulemap.get(p(0).toInt / 2).get.split(",")(1),df_lookup) } }))
+    outputArray.map(p => (featureRulesmap += p(0).trim.toInt -> p(4).toString))
+    val totalrecords = inputdf.count().toInt
+    finaloutput = ""
+    sqlContext.sql("drop table testdatatempdatable")
+    // inputdf.saveAsTable("testdatatempdatable")
+    sqlContext.cacheTable("testdatatempdatable")
+    for (leafnode <- leafNodes) {
+      leafnoderules = ""
+      var inputmap = scala.collection.mutable.Map[String, String]()
+      var n = leafnode.toInt / 2
+      while (n != 1) {
+        leafnoderules = featureRulesmap.get(n).get + " and " + leafnoderules
+        n = n / 2
+      }
+      val leafnoderulescondition = leafnoderules.substring(0, leafnoderules.size - 4)
+      leafnoderulescondition.split(" and ").filter(p => (p.trim != null)).map(p => (p.split(" in ")(0), p)).map(p => (p._1.substring(1, p._1.length), p._2)).map(p => (inputmap += p._1 -> p._2))
+      val rulesCondition = inputmap.toSeq.map(p => p._2).mkString(" and ")
+      val sqlcondition = "select count(*) from testdatatempdatable  where " + rulesCondition
+      val coverage = sqlContext.sql(sqlcondition).rdd.map(p => p.toString()).collect()
+      val coverageCount = coverage(0).substring(1, coverage(0).size - 1).toFloat
+      val frequency = ((coverageCount * 100) / totalrecords)
+      finaloutput = finaloutput + "----" + leafnode + "::" + rulesCondition + "::" + coverageCount + "::" + frequency
+    }
+    sqlContext.uncacheTable("testdatatempdatable")
+    val outputrdd = sc.parallelize(finaloutput.split("----"))
+    val splittedrdd = outputrdd.map(p => p.split("::", -1)).filter(p => p.size > 3)
+    val outputdf = splittedrdd.map(p => outputschema(p(0), p(1).replaceAll("\"", "").replaceAll("`", ""), p(2), p(3))).toDF
+    sqlContext.sql("DROP TABLE IF EXISTS  " + outputTableName)
+    //outputdf.saveAsTable(outputTableName)
+  }
+
+  /*
+The purpose of this method is to extract each node attributes by traversing from the root node.
+Input  : RootNode Object resulted from the Decision Tree Model
+Output : Get various attributes (NodeId, Prediction Vale, Probabliilty, Impurity, Rules Condition) of each node delimited by tab and each node's values delimited by "\n". Leaf node has only 4 attributes as it does not have rules condition
+Sample Output:
+
+        1	0.0	0.7633333333333333	0.36131111111111114	feature 2 <= 0.0,feature 2 > 0.0
+        2	0.0	0.5704225352112676	0.4900813330688355	feature 3 <= 8.0,feature 3 > 8.0
+        4	0.0	0.5954198473282443	0.4817901054717091	feature 5 <= 0.0,feature 5 > 0.0
+        8	0.0	0.6626506024096386	0.4470895630715633	feature 3 <= 4.0,feature 3 > 4.0
+        16	0.0	0.6231884057971014	0.4696492333543374	feature 3 <= 0.0,feature 3 > 0.0
+        32	0.0	0.76	0.3648
+        33	0.0	0.5454545454545454	0.49586776859504145
+        17	0.0	0.8571428571428571	0.24489795918367355	feature 0 <= 5.0,feature 0 > 5.0
+
+
+Each node contains the following attributes (sample): id = 1, isLeaf = false, predict = 0.0 (prob = 0.75), impurity = 0.375, split = Some(Feature = 3, threshold = 0.0, featureType = Continuous, categories = List()), stats = Some(gain = 0.125, impurity = 0.375, left impurity = 0.5, right impurity = 0.0)
+
+*/
+
+  def extractRulesFromModelTree(aNode: Node, left: String): String = {
+    var treeoutput = ""
+    var nodeValues = ""
+    var predictionString = aNode.predict.toString.split(" ")
+    var prediction = predictionString(0)
+    var prob = predictionString(3).substring(0, predictionString(3).size - 1)
+    nodeValues = aNode.id + "\t" + prediction + "\t" + prob + "\t" + aNode.impurity
+    if (aNode.isLeaf) {
+      rulestring = rulestring + "\n" + nodeValues
+    } else {
+      var leftsplitcondtion = ""
+      var rightsplitcondtion = ""
+      var nodeid = aNode.id
+      var featuretype = aNode.split.get.featureType
+      var featurenumber = aNode.split.get.feature
+      var threshold = aNode.split.get.threshold
+      var nodeSplitRuleCondition = ""
+      if (featuretype.toString == "Continuous") {
+        leftsplitcondtion = "feature " + featurenumber + " <= " + threshold
+        rightsplitcondtion = "feature " + featurenumber + " > " + threshold
+      } else {
+        leftsplitcondtion = "feature " + featurenumber + " in " + threshold
+        rightsplitcondtion = "feature " + featurenumber + " not in " + threshold
+      }
+      nodeSplitRuleCondition = leftsplitcondtion + "," + rightsplitcondtion
+      nodeValues = nodeValues + "\t" + nodeSplitRuleCondition
+      rulestring = rulestring + "\n" + nodeValues
+      extractRulesFromModelTree(aNode.leftNode.get, "true")
+      extractRulesFromModelTree(aNode.rightNode.get, "false")
+    }
+    return rulestring
+
+  }
+
+  /*
+ * Convert the rules condition from feature vectors to the actual variable and its values.
+ * Sample Input : "feature 7 > 0"
+ * Sample Output: (custcbcatname in ("Upgrade_Orders/Others","Troubleshoot/Others","Bill/Others"))
+ */
+  def featureToColumnName(feature: String, df_lookup: Array[org.apache.spark.sql.DataFrame]): String = {
+    val inputStringArray = feature.trim.split(" ",-1)
+    val featureIndex = inputStringArray(1).toInt
+    val logicalOperator = inputStringArray(2)
+    val filterValues = inputStringArray(3)
+    val featurename = featureColumnsArray(featureIndex)
+    val filterCondition = "`" + featurename + "_index` " + logicalOperator + " " + filterValues
+    var dfQueryOutput = df_lookup(featureIndex).filter(filterCondition).select(featurename).rdd.map(p => p.mkString).map(p => "\"" + p + "\"").collect().mkString(",")
+    var transformString = ""
+    if (dfQueryOutput == "") {
+      transformString = "(`" + featurename + "` in " + "(" + "\"\"" + ")" + ")"
+    } else {
+      transformString = "(`" + featurename + "` in " + "(" + dfQueryOutput + ")" + ")"
+    }
+    return transformString
+  }
+}
